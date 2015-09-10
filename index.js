@@ -3,19 +3,29 @@ var Engine = require('velocity').Engine,
     util = fis.util;
 
 /**
- * 通过内容获取需要的上下文，读取引入文件的同名xxx-mock.js文件
+ * 读取页面文件引入组件的同名xxx.mock文件，并将该文件加入页面文件的依赖缓存，用于同步更新
+ * @param {String|Array} widgets 组件路径
+ * @param {Object} file file实例
+ * @param {Array} root root目录设置
  * @return
  *  [Object]
  */
-function getContext(widgets, root) {
+function getContext(widgets, file, root) {
     var context = {};
 
+    if(!widgets) {
+        return context;
+    }
     widgets = util.isArray(widgets) ? widgets : [widgets];
     widgets.forEach(function(widget) {
-        var file = getAbsolutePath(replaceExt(widget, '.mock'), root);
-        if(file) {
-            util.merge(context, require(file));
-            delete require.cache[file];
+        // 如果widget不是file，则需要加入依赖缓存，用于同步更新
+        var dep = file.subpath === widget ? false : true;
+        widget = getAbsolutePath(replaceExt(widget, '.mock'), root);
+        if(widget) {
+            util.merge(context, require(widget));
+            delete require.cache[widget];
+
+            dep && addDeps(file, widget)
         }
     });
 
@@ -27,22 +37,115 @@ function getContext(widgets, root) {
  * @return
  *   [filepath, filepath...]
  */
-function getParseFiles(filepath, opt) {
-    var file = getAbsolutePath(filepath, opt.root),
-        result = [],
-        content = file ? util.read(file) : '',
-        regParse = /(#?)#parse\(('|")([^\)]+)\2\)/g,
-        _tmpArr;
+function getParseFiles(content, root) {
+    var result = {
+        content: content,
+        widgets: [],
+        scripts: [],
+        styles: []
+    };
 
-    while((_tmpArr = regParse.exec(content)) !== null) {
-        if(_tmpArr[1] !== '' || result.indexOf(_tmpArr[3]) >= 0) {
-            continue;
-        }
-        result.push(_tmpArr[3]);
-        result = result.concat(getParseFiles(_tmpArr[3], opt));
-    }
+    result = compileDirective(content, root);
+
+    var getSub = function(filepath, root) {
+        var file = getAbsolutePath(filepath, root);
+        var content = file ? util.read(file) : '';
+        var _tmpResult = compileDirective(content, root);
+
+        result.widgets = result.widgets.concat(_tmpResult.widgets);
+        result.scripts = result.scripts.concat(_tmpResult.scripts);
+        result.styles = result.styles.concat(_tmpResult.styles);
+
+        _tmpResult.widgets.forEach(function(widget) {
+            getSub(widget, root);
+        });
+    };
+    result.widgets.forEach(function(widget) {
+        getSub(widget, root);
+    });
 
     return result;
+}
+
+/**
+ * 编译组件化指令
+ * @param  {String} content 文件内容
+ * @return {Object} 编译后的文件内容及收集到的依赖资源
+ * @example
+ * {
+ *   content: {String} 编译后的文件内容
+ *   widgets: {Array} 引用的组件
+ *   scripts: {Array} 依赖的js文件
+ *   styles: {Array} 依赖的css文件
+ * }
+ */
+function compileDirective(content, root) {
+    var rWidget = /(#?)#widget\(('|")([^\)]+)\2\)/g;
+    var rScript = /(#?)#script\(('|")([^\)]+)\2\)/g;
+    var rStyle = /(#?)#style\(('|")([^\)]+)\2\)/g;
+    var rUri = /(#?)#uri\(('|")([^\)]+)\2\)/g;
+
+    var widgets = [], scripts = [], styles = [];
+
+    // 将#widget变成#parse，并记录引用组件路径
+    content = content.replace(rWidget, function(match, comment, qoutes, filepath) {
+        if(comment) {
+            return match;
+        }
+        widgets.push(filepath);
+        return '#parse("' + filepath + '")';
+    });
+    // 将#script替换为空，并记录引用路径，用于统一打包策略
+    content = content.replace(rScript, function(match, comment, qoutes, filepath) {
+        if(comment) {
+            return match;
+        }
+        scripts.push(filepath);
+        return '';
+    });
+    // 将#style替换为空，并记录引用路径，用于统一打包策略
+    content = content.replace(rStyle, function(match, comment, qoutes, filepath) {
+        if(comment) {
+            return match;
+        }
+        styles.push(filepath);
+        return '';
+    });
+    // 直接引用资源路径，不做依赖处理
+    content = content.replace(rUri, function(match, comment, qoutes, filepath) {
+        if(comment) {
+            return match;
+        }
+        return filepath;
+    });
+
+    // 尝试将组件的js和css文件加入依赖
+    widgets.forEach(function(widget) {
+        var widget = widget[0] === '/' ? widget : '/' + widget,
+            scssFile = replaceExt(widget, '.scss'),
+            lessFile = replaceExt(widget, '.less'),
+            cssFile = replaceExt(widget, '.css'),
+            jsFile = replaceExt(widget, '.js');
+
+        if(getAbsolutePath(scssFile, root)) {
+            styles.push(scssFile);
+        }
+        if(getAbsolutePath(lessFile, root)) {
+            styles.push(lessFile);
+        }
+        if(getAbsolutePath(cssFile, root)) {
+            styles.push(cssFile);
+        }
+        if(getAbsolutePath(jsFile, root)) {
+            scripts.push(jsFile);
+        }
+    });
+    return {
+        content: content,
+        widgets: widgets,
+        scripts: scripts,
+        styles: styles
+    };
 }
 
 /** 替换文件的扩展名
@@ -76,15 +179,12 @@ function getAbsolutePath(file, root) {
 /**
  * 添加静态资源依赖
  */
-function addStatics(widgets, content, file, opt) {
+function addStatics(resources, content, opt) {
     var
-        // css文件数组
-        arrCss = [],
-        // js文件数组
-        arrJs = [],
         // js拼接字符串
         strJs = '',
-        loadJs = opt.loadJs,
+        // css拼接字符串
+        strCss = '',
         // 模块化加载函数名称[requirejs|modjs|seajs]
         loader = opt.loader || null,
         loadSync = opt.loadSync,
@@ -92,61 +192,39 @@ function addStatics(widgets, content, file, opt) {
         rCssHolder = /<!--\s?WIDGET_CSS_HOLDER\s?-->/,
         rJsHolder = /<!--\s?WIDGET_JS_HOLDER\s?-->/;
 
-    widgets.forEach(function(widget) {
-        var widget = widget[0] === '/' ? widget : '/' + widget,
-            scssFile = replaceExt(widget, '.scss'),
-            lessFile = replaceExt(widget, '.less'),
-            cssFile = replaceExt(widget, '.css'),
-            jsFile = replaceExt(widget, '.js');
-
-        if(getAbsolutePath(scssFile, root)) {
-            arrCss.push('<link rel="stylesheet" href="' + scssFile + '">\n');
-        }
-        if(getAbsolutePath(lessFile, root)) {
-            arrCss.push('<link rel="stylesheet" href="' + lessFile + '">\n')
-        }
-        if(getAbsolutePath(cssFile, root)) {
-            arrCss.push('<link rel="stylesheet" href="' + cssFile + '">\n');
-        }
-        if(loadJs && getAbsolutePath(jsFile, root)) {
-            // 模块化加载，只保存文件路径
-            if(loader) {
-                arrJs.push(jsFile);
-            } else {
-                arrJs.push('<script src="' + jsFile + '"></script>\n');
-            }
-        }
+    // 拼接script标签
+    resources.scripts.forEach(function(js) {
+        strJs += '<script src="' + js + '"></script>\n';
     });
 
-    if(arrJs.length > 0) {
-        // 非模块化直接拼接script标签
-        if(!loader) {
-            strJs = arrJs.join('');
-        } else {
-            // 如果开启同步加载，需要script标签直接引入
-            if(loadSync) {
-                arrJs.forEach(function(js) {
-                    strJs += '<script src="' + js + '"></script>\n';
-                })
-            }
-            switch(loader) {
-                case 'require':
-                case 'requirejs':
-                case 'modjs':
-                    strJs += '<script>require(["' + arrJs.join('","') + '"]);</script>\n';
-                    break;
-                case 'seajs.use':
-                case 'seajs':
-                    strJs += '<script>seajs.use(["' + arrJs.join('","') + '"]);</script>\n';
-            }
+    // 模块化加载
+    if(loader && resources.scripts.length > 0) {
+        // 如果没开启同步加载，先清空strJs
+        if(!loadSync) {
+            strJs = '';
+        }
+        switch(loader) {
+            case 'require':
+            case 'requirejs':
+            case 'modjs':
+                strJs += '<script>require(["' + resources.scripts.join('","') + '"]);</script>\n';
+                break;
+            case 'seajs.use':
+            case 'seajs':
+                strJs += '<script>seajs.use(["' + resources.scripts.join('","') + '"]);</script>\n';
         }
     }
 
+    // 拼接link标签
+    resources.styles.forEach(function(css) {
+        strCss += '<link rel="stylesheet" href="' + css + '">\n';
+    })
+
     if(rCssHolder.test(content)) {
-        content = content.replace(rCssHolder, arrCss.join(''));
+        content = content.replace(rCssHolder, strCss);
     } else {
         // css放在</head>标签之前
-        content = content.replace(/(<\/head>)/i, arrCss.join('') + '$1');
+        content = content.replace(/(<\/head>)/i, strCss + '$1');
     }
 
     if(rJsHolder.test(content)) {
@@ -163,9 +241,8 @@ function addStatics(widgets, content, file, opt) {
  * 对文件内容进行渲染
  */
 function renderTpl(content, file, opt) {
-    var widgets,
+    var resources,
         context = {},
-        pageMock,
         commonMock = opt.commonMock,
         root = opt.root,
         parse = opt.parse;
@@ -175,7 +252,7 @@ function renderTpl(content, file, opt) {
     }
 
     // 获取#parse引入的文件
-    widgets = getParseFiles(file.subpath, opt);
+    resources = getParseFiles(content, root);
 
     // 添加全局mock到context
     if(commonMock) {
@@ -184,31 +261,19 @@ function renderTpl(content, file, opt) {
         addDeps(file, commonMock);
     }
 
-    // 将页面文件同名xxx-mock.js文件加入context
-    util.merge(context, getContext(file.subpath, root));
+    // 将页面文件同名xxx.mock文件加入context
+    util.merge(context, getContext(file.subpath, file, root));
 
-    // 将页面文件同名xxx-mock.js加入依赖缓存，用于同步更新
-    pageMock = getAbsolutePath(replaceExt(file.subpath, '.mock'), root);
-    pageMock && addDeps(file, pageMock);
-
-    // 将widgets的xxx-mock.js文件加入context
-    util.merge(context, getContext(widgets, root));
+    // 将widgets的xxx.mock文件加入context
+    util.merge(context, getContext(resources.widgets, file, root));
 
     // 得到解析后的文件内容
-    content = parse ? new Engine(opt).render(context) : content;
+    resources.content = parse ? new Engine(opt).render(context) : resources.content;
 
     // 添加widgets的js和css依赖到输入内容
-    content = addStatics(widgets, content, file, opt);
+    resources.content = addStatics(resources, resources.content, opt);
 
-    // 添加widget依赖到fis缓存，用于同步更新
-    widgets.forEach(function(widget) {
-        var tpl = getAbsolutePath(widget, root);
-        var mock = getAbsolutePath(replaceExt(widget, '.mock'), root);
-        tpl && addDeps(file, tpl);
-        mock && addDeps(file, mock);
-    });
-
-    return content;
+    return resources.content;
 }
 
 /*

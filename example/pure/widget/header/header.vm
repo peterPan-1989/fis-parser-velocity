@@ -6,4 +6,4 @@
 	<div class="loginlink"><a href="">登录</a></div>
 	#end
 </header>
-#parse('widget/common/common.vm')
+#widget('widget/common/common.vm')

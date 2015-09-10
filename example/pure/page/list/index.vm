@@ -7,13 +7,12 @@
     <meta name="keywords" content="">
 </head>
 <body>
-    #parse('widget/header/header.vm')
-    #parse('widget/common/common.vm')
+    #widget('widget/header/header.vm')
 
     #if(1>2)
-    #parse('list/list.vm')
+    #widget('list/list.vm')
     #end
-    #parse('widget/footer/footer.vm')
+    #widget('widget/footer/footer.vm')
 
 <script src="http://apps.bdimg.com/libs/jquery/2.1.4/jquery.min.js"></script>
 </body>
